@@ -455,6 +455,7 @@ class Kubernetes(clouds.Cloud):
         k8s_topology_label_value = None
         k8s_resource_key = None
         tpu_requested = False
+        avoid_label_keys = None
 
         # If GPU/TPUs are requested, set node label to match the GPU/TPU type.
         if acc_count > 0 and acc_type is not None:
@@ -468,6 +469,9 @@ class Kubernetes(clouds.Cloud):
                 k8s_resource_key = kubernetes_utils.TPU_RESOURCE_KEY
             else:
                 k8s_resource_key = kubernetes_utils.get_gpu_resource_key()
+        else:
+            avoid_label_keys = kubernetes_utils.get_accelerator_label_keys(
+                context)
 
         port_mode = network_utils.get_port_mode(None)
 
@@ -574,6 +578,7 @@ class Kubernetes(clouds.Cloud):
             'skypilot_ray_port': constants.SKY_REMOTE_RAY_PORT,
             'ray_worker_start_command': instance_setup.ray_worker_start_command(
                 custom_resources, custom_ray_options, no_restart=False),
+            'avoid_label_keys': avoid_label_keys,
         }
 
         # Add kubecontext if it is set. It may be None if SkyPilot is running
