@@ -15,6 +15,7 @@ import typing
 from typing import Dict, List, Optional, Set, Tuple
 
 import dotenv
+import filelock
 
 import sky
 from sky import core
@@ -1676,10 +1677,19 @@ class ControllerManager:
         # launch).
         self._starting_signal = asyncio.Condition(lock=self._job_tasks_lock)
 
+        # Store graceful cancel info per job, keyed by job_id.
+        # Populated by cancel_job() and consumed by run_job().
+        self._cancel_info: Dict[int, Tuple[bool, Optional[int]]] = {}
+        self._cancel_info_lock = asyncio.Lock()
+
         self._pid = os.getpid()
         self._pid_started_at = psutil.Process(self._pid).create_time()
 
-    async def _cleanup(self, job_id: int, pool: Optional[str] = None):
+    async def _cleanup(self,
+                       job_id: int,
+                       pool: Optional[str] = None,
+                       graceful: bool = False,
+                       graceful_timeout: Optional[int] = None):
         """Clean up the cluster(s) and storages.
 
         (1) Clean up the succeeded task(s)' ephemeral storage. The storage has
@@ -1704,7 +1714,10 @@ class ControllerManager:
                     cluster_name = (
                         managed_job_utils.generate_managed_job_cluster_name(
                             task.name, job_id))
-                    managed_job_utils.terminate_cluster(cluster_name)
+                    managed_job_utils.terminate_cluster(
+                        cluster_name,
+                        graceful=graceful,
+                        graceful_timeout=graceful_timeout)
                     status = core.status(cluster_names=[cluster_name],
                                          all_users=True)
                     assert (len(status) == 0 or
@@ -1847,6 +1860,7 @@ class ControllerManager:
                     '%s', job_id, e)
 
         cancelling = False
+        graceful, graceful_timeout = False, None
         try:
             controller = JobController(job_id, self.starting,
                                        self._job_tasks_lock,
@@ -1865,6 +1879,14 @@ class ControllerManager:
             await task
         except asyncio.CancelledError:
             logger.info(f'Job {job_id} was cancelled')
+
+            async with self._cancel_info_lock:
+                cancel_info = self._cancel_info.pop(job_id, None)
+            if cancel_info is not None:
+                graceful, graceful_timeout = cancel_info
+                logger.debug(f'Job {job_id} graceful cancel: '
+                             f'graceful={graceful}, timeout={graceful_timeout}')
+
             dag = _get_dag(job_id)
             task_id, _ = await (
                 managed_job_state.get_latest_task_id_status_async(job_id))
@@ -1883,7 +1905,10 @@ class ControllerManager:
             raise
         finally:
             try:
-                await self._cleanup(job_id, pool=pool)
+                await self._cleanup(job_id,
+                                    pool=pool,
+                                    graceful=graceful,
+                                    graceful_timeout=graceful_timeout)
                 logger.info(
                     f'Cluster of managed job {job_id} has been cleaned up.')
             except Exception as e:  # pylint: disable=broad-except
@@ -1970,6 +1995,14 @@ class ControllerManager:
         while True:
             cancels = os.listdir(jobs_constants.CONSOLIDATED_SIGNAL_PATH)
             for cancel in cancels:
+                if not cancel.isdigit():
+                    # There maybe unexpected files that are written to the
+                    # signal directory. We for sure write filelocks to the
+                    # directory, so we need to skip.
+                    if not cancel.endswith('.lock'):
+                        logger.debug('Detected unexpected file in signal '
+                                     f'directory: {cancel}. Skipping...')
+                    continue
                 async with self._job_tasks_lock:
                     job_id = int(cancel)
                     if job_id in self.job_tasks:
@@ -1977,13 +2010,30 @@ class ControllerManager:
 
                         task = self.job_tasks[job_id]
 
-                        # Run the cancellation in the background, so we can
-                        # return immediately.
+                        signal_path = os.path.join(
+                            jobs_constants.CONSOLIDATED_SIGNAL_PATH, cancel)
+                        with filelock.FileLock(signal_path + '.lock'):
+                            try:
+                                content = pathlib.Path(signal_path).read_text(
+                                    encoding='utf-8').strip()
+                            except Exception as e:  # pylint: disable=broad-except
+                                content = ''
+                                logger.debug(
+                                    'Problem occurred when reading '
+                                    f'{signal_path}: '
+                                    f'{common_utils.format_exception(e)}')
+                            finally:
+                                os.remove(signal_path)
+
+                        # Parse and store graceful cancel info before
+                        # cancelling the task.
+                        graceful, graceful_timeout = managed_job_utils.parse_job_cancel_file(  # pylint: disable=line-too-long
+                            content)
+                        async with self._cancel_info_lock:
+                            self._cancel_info[job_id] = (graceful,
+                                                         graceful_timeout)
                         task.cancel()
                         logger.info(f'Job {job_id} cancelled successfully')
-
-                        os.remove(f'{jobs_constants.CONSOLIDATED_SIGNAL_PATH}/'
-                                  f'{job_id}')
             await asyncio.sleep(15)
 
     async def monitor_loop(self):
