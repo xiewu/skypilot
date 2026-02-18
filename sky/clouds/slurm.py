@@ -3,6 +3,8 @@
 import typing
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
+import colorama
+
 from sky import catalog
 from sky import clouds
 from sky import exceptions
@@ -59,6 +61,19 @@ class Slurm(clouds.Cloud):
     _MAX_CLUSTER_NAME_LEN_LIMIT = 120
     _regions: List[clouds.Region] = []
     _INDENT_PREFIX = '    '
+    # Known shared filesystem types that SkyPilot requires for Slurm.
+    # Names as returned by `stat -f -c %T`.
+    _SHARED_FS_TYPES = frozenset({
+        'nfs',
+        'nfs4',
+        'lustre',
+        'gpfs',
+        'beegfs',
+        'ceph',
+        'fuse.ceph',
+        'glusterfs',
+        'fuse.glusterfs',
+    })
 
     # Same as Kubernetes.
     _DEFAULT_NUM_VCPUS_WITH_GPU = 4
@@ -583,7 +598,22 @@ class Slurm(clouds.Cloud):
                 )
                 info = client.info()
                 logger.debug(f'Slurm cluster {cluster} sinfo: {info}')
-                ctx2text[cluster] = 'enabled'
+                fs_type = client.check_homedir_shared_fs()
+                if fs_type is not None and fs_type not in cls._SHARED_FS_TYPES:
+                    ctx2text[cluster] = (
+                        f'{colorama.Fore.GREEN}enabled.'
+                        f'{colorama.Style.RESET_ALL} '
+                        f'{colorama.Fore.LIGHTYELLOW_EX}'
+                        'Warning: Home directory (~) filesystem '
+                        f'type is {fs_type!r}, not a shared '
+                        'filesystem. SkyPilot requires ~ to be '
+                        'on a shared filesystem (e.g., NFS) '
+                        'visible to all nodes. Customizing the '
+                        'home directory will be supported in a '
+                        'future release.'
+                        f'{colorama.Style.RESET_ALL}')
+                else:
+                    ctx2text[cluster] = 'enabled'
                 success = True
             except KeyError as e:
                 key = e.args[0]
