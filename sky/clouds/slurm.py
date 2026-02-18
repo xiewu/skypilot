@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 from sky import catalog
 from sky import clouds
+from sky import exceptions
 from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import slurm
@@ -49,6 +50,11 @@ class Slurm(clouds.Cloud):
             'Slurm.',
         clouds.CloudImplementationFeatures.LOCAL_DISK:
             (f'Local disk is not supported on {_REPR}'),
+        clouds.CloudImplementationFeatures.DOCKER_IMAGE:
+            'Docker image is not supported on this Slurm cluster because '
+            'the Pyxis plugin is not installed. Please ask your cluster '
+            'administrator to install Pyxis '
+            '(https://github.com/NVIDIA/pyxis).',
     }
     _MAX_CLUSTER_NAME_LEN_LIMIT = 120
     _regions: List[clouds.Region] = []
@@ -73,9 +79,28 @@ class Slurm(clouds.Cloud):
         resources: 'resources_lib.Resources',
         region: Optional[str] = None,
     ) -> Dict[clouds.CloudImplementationFeatures, str]:
-        del region  # unused
-        # logger.critical('[BYPASS] Check Slurm's unsupported features...')
-        return cls._CLOUD_UNSUPPORTED_FEATURES
+        unsupported = cls._CLOUD_UNSUPPORTED_FEATURES.copy()
+        # Docker image support requires the Pyxis SPANK plugin.
+        # When region is None, we check all clusters and mark Docker as
+        # supported if ANY cluster has Pyxis. This is intentionally
+        # permissive -- per-cluster filtering happens in
+        # regions_with_offering(), which calls check_features_are_supported()
+        # with a specific region to filter out non-Pyxis clusters.
+        cluster = region if region is not None else resources.region
+        if cluster is None:
+            clusters = cls.existing_allowed_clusters()
+        else:
+            clusters = [cluster]
+        for c in clusters:
+            try:
+                if slurm_utils.check_pyxis_enabled(c):
+                    unsupported.pop(
+                        clouds.CloudImplementationFeatures.DOCKER_IMAGE, None)
+                    break
+            except Exception as e:  # pylint: disable=broad-except
+                logger.debug(f'Failed to check Pyxis on cluster {c}: '
+                             f'{common_utils.format_exception(e)}')
+        return unsupported
 
     @classmethod
     def _max_cluster_name_length(cls) -> Optional[int]:
@@ -199,7 +224,7 @@ class Slurm(clouds.Cloud):
         zone: Optional[str],
         resources: Optional['resources_lib.Resources'] = None
     ) -> List[clouds.Region]:
-        del accelerators, use_spot, resources  # unused
+        del accelerators, use_spot  # unused
         existing_clusters = cls.existing_allowed_clusters()
 
         regions: List[clouds.Region] = []
@@ -223,6 +248,23 @@ class Slurm(clouds.Cloud):
             if zones:
                 r.set_zones(zones)
             regions.append(r)
+
+        # Filter out clusters that do not support the requested features
+        # (e.g., Docker image requires Pyxis).
+        if resources is not None:
+            resources_required_features = (
+                resources.get_required_cloud_features())
+            filtered_regions = []
+            for r in regions:
+                try:
+                    cls.check_features_are_supported(
+                        resources, resources_required_features, r.name)
+                    filtered_regions.append(r)
+                except exceptions.NotSupportedError as e:
+                    logger.info(f'Excluding Slurm cluster '
+                                f'{r.name!r}: {e}')
+                    continue
+            regions = filtered_regions
 
         # Check if requested instance type will fit in the cluster.
         if instance_type is None:
